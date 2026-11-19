@@ -1,0 +1,106 @@
+PANEL ADMINISTRATIVO — FACTURACIÓN KYTE + VISTA RÁPIDA
+=====================================================
+Archivo: index-panel-admin.html
+Respaldo del original: index-panel-admin.ANTES-por-si-algo.html
+
+REGLA QUE MANDA EN TODO ESTO:
+el panel NUNCA da por pagado ni por facturado un pedido sin que vos lo confirmes.
+Si la tienda o el banco dice "pagado", el panel muestra "Por confirmar" hasta que
+lo verifiqués en tu cuenta LAFISE. Si nadie escribe el número de factura de Kyte,
+el pedido queda "Pendiente" en rojo.
+
+
+1) COLUMNAS "# FACTURA" → "PEDIDO NO."
+   Se cambiaron las 4 tablas (Inicio pedidos pendientes, ventas del día,
+   Gestión de Pedidos y detalle de ingresos). Ahora dice "Pedido No." como en
+   la Tienda en Línea y la Tarjeta de Fidelidad.
+
+2) ESTADO DEL PAGO: "POR CONFIRMAR"
+   - Antes: cualquier pedido que no estuviera "pendiente" se mostraba "Pagado"
+     sin verificar nada.
+   - Ahora: Crédito / Pendiente / POR CONFIRMAR (azul) / Pagado.
+   - "Por confirmar" es el aviso de que hay que revisar LAFISE antes de
+     registrarlo como cobrado. El panel no lo decide solo.
+
+3) TRES ESTADOS CLAROS POR PEDIDO
+   Pendiente (rojo) → Facturado en Kyte (azul) → Entregado (verde)
+   - Se calcula solo: si ya lo entregaste aparece Entregado; si ya tiene
+     número de factura aparece Facturado en Kyte; si no, Pendiente.
+
+4) NÚMERO DE FACTURA DE KYTE GUARDADO CON EL PEDIDO
+   - Botón azul con el ícono de factura en cada fila (Inicio, Gestión de
+     Pedidos y Vista Rápida). Abre una ventana donde escribís el número que te
+     dio Kyte (ej: 001-000123) y queda guardado junto al pedido.
+   - Se guarda en el equipo (localStorage PG_KYTE_FACT_V1) y además en Firebase
+     en la ruta facturas_kyte/<pedido>, así no se pierde si cambiás de máquina
+     o entrás desde el teléfono.
+   - Si te equivocaste, dentro de la misma ventana podés borrar el número y el
+     pedido vuelve a Pendiente.
+   - El número se ve como etiqueta azul en su columna "Factura Kyte".
+   - TARJETA DE FIDELIDAD: los pedidos que llegan con origen "Tarjeta
+     Fidelidad" entran igual y también se les puede anotar factura.
+
+5) BUSCADOR (Gestión de Pedidos y Vista Rápida)
+   Buscá por Pedido No., nombre del cliente, teléfono o número de factura.
+   - Ignora tildes: "maria" encuentra a "María".
+   - Ignora espacios y guiones en teléfonos: "88881234" encuentra "8888 1234".
+   Tu caso típico: el cliente te escribe por WhatsApp, ponés su número y ves al
+   instante su pedido y con qué número de factura de Kyte se facturó.
+
+6) VISTA RÁPIDA DE PEDIDOS (menú nuevo "Vista Rápida" con rayo)
+   Pensada para control de inventario en un solo pantallazo:
+   - Tres contadores arriba: Pendientes / Facturados en Kyte / Entregados hoy.
+   - Tabla con: Pedido No. y fecha, cliente y teléfono, canal (Tienda o
+     Tarjeta), productos y cantidades, semáforo de Inventario, total, factura
+     de Kyte y los botones de acción.
+   - Semáforo de inventario por pedido:
+       verde  = Stock OK (alcanza para todo lo que pide)
+       rojo   = Falta stock (pide más de lo que hay)
+       gris   = Sin control (producto que no se controla en stock)
+     Cruza cada artículo del pedido con tu inventario real del panel.
+   - Acciones en cada fila: anotar/corregir factura, entregar, ver el recibo y
+     cancelar, sin salir de la pantalla.
+   - Nota al pie: el inventario se descuenta al ENTREGAR, no al recibir el
+     pedido, para no descontar mercadería de pedidos que se caen.
+
+7) CONTADORES EN GESTIÓN DE PEDIDOS
+   Arriba a la derecha: Pendientes, Por facturar y Facturados, para ver de un
+   vistazo cuánta factura te falta emitir en Kyte.
+
+8) PERMISOS
+   La Vista Rápida queda disponible para los roles Ventas e Inventario.
+
+
+CÓMO SE USA (día a día)
+------------------------
+1. Entra un pedido → aparece en Pendiente con la etiqueta "Por facturar".
+2. Verificás el pago en LAFISE.
+3. Hacés la factura a mano en Kyte.
+4. Clic en el botón azul de factura de esa fila → pegás el número → Guardar.
+   El pedido pasa a "Facturado en Kyte".
+5. Cuando lo entregás, clic en el camión → Confirmar entrega → pasa a Entregado.
+
+
+LO QUE NO SE TOCÓ
+------------------
+- No se inventó facturación automática ni conexión con Kyte: la factura oficial
+  la seguís emitiendo vos a mano, el panel solo la anota.
+- No se cambió el diseño general, los colores ni el menú existente (solo se
+  agregó una entrada nueva).
+- No se tocaron las funciones de abonos, cuentas por cobrar, cupones ni
+  promociones.
+
+
+VALIDACIÓN HECHA
+-----------------
+- Los 3 bloques de código del panel pasan revisión de sintaxis sin errores.
+- Pruebas de lógica en Node: estados, guardado de factura, buscador (con y sin
+  tildes, por teléfono y por número de factura), semáforo de inventario,
+  conteo de contadores y lectura desde Firebase.
+- Prueba de render: Inicio, Gestión de Pedidos y Vista Rápida generan su HTML
+  sin errores.
+- Confirmado: ya no queda ni una columna "# Factura" en el archivo.
+
+NOTA: probado con datos simulados en el equipo, no en un navegador real.
+Al subirlo al repo y abrirlo, revisá que cargue con tu sesión y que aparezcan
+los pedidos en vivo (la sincronización usa la misma conexión que ya tenías).

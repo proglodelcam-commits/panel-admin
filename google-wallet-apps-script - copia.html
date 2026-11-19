@@ -1,0 +1,85 @@
+/**
+ * PG del Campo — Backend "Agregar a Google Wallet"
+ * Genera un pase de Tarjeta de Fidelidad (loyalty) y redirige a Google Wallet.
+ *
+ * >>> CONFIGURA ESTOS 3 VALORES (los obtienes en los pasos del chat) <<<
+ */
+const WALLET_ISSUER_ID = '3388000000023218219';                                       // Dato 1 (ya puesto)
+const WALLET_SA_EMAIL  = 'wallet-pg@productos-globales-campo.iam.gserviceaccount.com';  // Dato 2 (ya puesto)
+
+// Dato 3: pega aqui, ENTRE las comillas, el valor de "private_key" del archivo .json
+// (todo el texto que empieza en -----BEGIN... y termina en ...END PRIVATE KEY-----\n).
+// No borres las comillas ni el .replace del final.
+const WALLET_SA_KEY = `const PRIVATE_KEY = "...OCULTA...";`.replace(/\\n/g, '\n');
+
+/* Datos del programa (puedes dejarlos así) */
+const CLASS_SUFFIX = 'club_pg_del_campo';
+const LOGO_URL = 'https://proglodelcam-commits.github.io/pgdelcampo-on-line/android-chrome-512x512.png';
+const BG_COLOR = '#1b382b';
+
+function doGet(e) {
+  const p = (e && e.parameter) || {};
+  if (p.action !== 'wallet') {
+    return HtmlService.createHtmlOutput('<p>PG del Campo — servicio Wallet activo.</p>');
+  }
+
+  const tel = String(p.tel || '').replace(/[^0-9]/g, '') || 'invitado';
+  const nombre = (p.nombre || 'Cliente PG').toString().slice(0, 40);
+  const estrellas = parseInt(p.estrellas || '0', 10) || 0;
+  const compras = parseInt(p.compras || '0', 10) || 0;
+
+  const classId = WALLET_ISSUER_ID + '.' + CLASS_SUFFIX;
+  const objectId = WALLET_ISSUER_ID + '.' + tel;
+
+  const loyaltyClass = {
+    id: classId,
+    issuerName: 'PG del Campo',
+    programName: 'Club PG del Campo',
+    programLogo: { sourceUri: { uri: LOGO_URL } },
+    reviewStatus: 'UNDER_REVIEW',
+    hexBackgroundColor: BG_COLOR,
+    countryCode: 'NI'
+  };
+
+  const loyaltyObject = {
+    id: objectId,
+    classId: classId,
+    state: 'ACTIVE',
+    accountId: tel,
+    accountName: nombre,
+    loyaltyPoints: { label: 'Estrellas', balance: { int: estrellas } },
+    secondaryLoyaltyPoints: { label: 'Compras', balance: { int: compras } },
+    barcode: { type: 'QR_CODE', value: tel, alternateText: tel }
+  };
+
+  const claims = {
+    iss: WALLET_SA_EMAIL,
+    aud: 'google',
+    typ: 'savetowallet',
+    iat: Math.floor(Date.now() / 1000),
+    origins: [],
+    payload: { loyaltyClasses: [loyaltyClass], loyaltyObjects: [loyaltyObject] }
+  };
+
+  const jwt = signJwt_(claims);
+  const url = 'https://pay.google.com/gp/v/save/' + jwt;
+  return HtmlService.createHtmlOutput(
+    '<!doctype html><meta charset="utf-8">' +
+    '<meta http-equiv="refresh" content="0;url=' + url + '">' +
+    '<p style="font-family:sans-serif;text-align:center;margin-top:40px">' +
+    'Abriendo Google Wallet… si no ocurre nada, <a href="' + url + '">toca aquí</a>.</p>'
+  );
+}
+
+function base64url_(bytes) {
+  return Utilities.base64EncodeWebSafe(bytes).replace(/=+$/, '');
+}
+
+function signJwt_(claims) {
+  const header = { alg: 'RS256', typ: 'JWT' };
+  const h = base64url_(Utilities.newBlob(JSON.stringify(header)).getBytes());
+  const c = base64url_(Utilities.newBlob(JSON.stringify(claims)).getBytes());
+  const toSign = h + '.' + c;
+  const sig = Utilities.computeRsaSha256Signature(toSign, WALLET_SA_KEY);
+  return toSign + '.' + base64url_(sig);
+}

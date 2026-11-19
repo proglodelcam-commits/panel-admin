@@ -1,60 +1,116 @@
-/* PG del Campo — Service Worker PWA
- * v3: estrategia "red primero" (network-first) para que los cambios del sitio
- * se vean enseguida al recargar, y la caché solo sirva de respaldo sin conexión.
- * Al subir una versión nueva, sube el número de CACHE (v3 -> v4) para forzar
- * la limpieza de la caché anterior en todos los dispositivos.
- */
-const CACHE = 'pgdelcampo-v3';
-const CORE = [
+// ═══════════════════════════════════════════════════════
+// PG del Campo — Service Worker Unificado (GitHub Pages PWA)
+// Versión: 2.0 — 2026-09-11
+// ═══════════════════════════════════════════════════════
+
+const CACHE_NAME = 'pg-del-campo-v2';
+
+// Assets locales a pre-cachear durante la instalación
+const PRECACHE_ASSETS = [
   './',
   './index.html',
-  './css/styles.css',
+  './tienda.html',
+  './fidelidad.html',
+  './admin.html',
+  './enlaces.html',
   './manifest.webmanifest',
-  './img/logo-pg.png',
-  './img/icon-192.png',
-  './img/icon-512.png'
+  './favicon.ico',
+  './icons/favicon.png',
+  './icons/favicon-16x16.png',
+  './icons/favicon-32x32.png',
+  './icons/favicon-48x48.png',
+  './icons/apple-touch-icon.png',
+  './icons/android-chrome-192x192.png',
+  './icons/android-chrome-512x512.png'
 ];
 
-// Instalación: precache base + activar de inmediato la nueva versión
-self.addEventListener('install', function (event) {
+// Dominios externos que cacheamos como runtime
+const RUNTIME_CACHE_HOSTS = [
+  'fonts.googleapis.com',
+  'fonts.gstatic.com',
+  'cdnjs.cloudflare.com',
+  'www.gstatic.com',
+  'cdn.jsdelivr.net',
+  'api.qrserver.com'
+];
+
+// ── INSTALL: pre-cachea todos los assets locales ──
+self.addEventListener('install', event => {
   event.waitUntil(
-    caches.open(CACHE).then(function (cache) {
-      return Promise.allSettled(CORE.map(function (url) { return cache.add(url); }));
-    }).then(function () { return self.skipWaiting(); })
+    caches.open(CACHE_NAME)
+      .then(cache => {
+        console.log('[SW] Pre-cacheando assets locales');
+        return cache.addAll(PRECACHE_ASSETS);
+      })
+      .then(() => self.skipWaiting())
   );
 });
 
-// Activación: borrar TODAS las cachés antiguas y tomar control ya
-self.addEventListener('activate', function (event) {
+// ── ACTIVATE: limpia caches viejas y toma control ──
+self.addEventListener('activate', event => {
   event.waitUntil(
-    caches.keys().then(function (keys) {
-      return Promise.all(keys.map(function (k) {
-        if (k !== CACHE) { return caches.delete(k); }
-      }));
-    }).then(function () { return self.clients.claim(); })
+    caches.keys().then(keys =>
+      Promise.all(
+        keys.filter(k => k !== CACHE_NAME).map(k => {
+          console.log('[SW] Eliminando cache vieja:', k);
+          return caches.delete(k);
+        })
+      )
+    )
   );
+  self.clients.claim();
 });
 
-// Fetch: RED PRIMERO para todo (navegación y estáticos).
-// Si hay internet, siempre trae el archivo más reciente y actualiza la caché;
-// si no hay internet, usa la copia guardada (modo offline).
-self.addEventListener('fetch', function (event) {
-  const req = event.request;
-  if (req.method !== 'GET') { return; }
+// ── FETCH: estrategia cache-first para locales, network-first para externos ──
+self.addEventListener('fetch', event => {
+  const url = new URL(event.request.url);
 
-  event.respondWith(
-    fetch(req).then(function (res) {
-      // Guardar copia fresca solo de respuestas válidas del mismo origen
-      if (res && res.status === 200 && res.type === 'basic') {
-        const copy = res.clone();
-        caches.open(CACHE).then(function (c) { c.put(req, copy); });
-      }
-      return res;
-    }).catch(function () {
-      // Sin conexión: devolver caché; para navegación, caer al index
-      return caches.match(req).then(function (r) {
-        return r || (req.mode === 'navigate' ? caches.match('./index.html') : undefined);
-      });
-    })
-  );
+  // Solo interceptar GET requests
+  if (event.request.method !== 'GET') return;
+
+  // Firebase RTDB: NO cachear (datos en tiempo real)
+  if (url.hostname.includes('firebaseio.com')) return;
+
+  // Recursos locales: Cache-First
+  if (url.origin === self.location.origin) {
+    event.respondWith(
+      caches.match(event.request).then(cached => {
+        if (cached) return cached;
+        return fetch(event.request).then(response => {
+          // Cachear la respuesta para futuras visitas
+          if (response.ok) {
+            const clone = response.clone();
+            caches.open(CACHE_NAME).then(cache => cache.put(event.request, clone));
+          }
+          return response;
+        }).catch(() => {
+          // Fallback offline para navegación
+          if (event.request.mode === 'navigate') {
+            return caches.match('./index.html');
+          }
+        });
+      })
+    );
+    return;
+  }
+
+  // Recursos externos (CDNs): Stale-While-Revalidate
+  if (RUNTIME_CACHE_HOSTS.some(h => url.hostname.includes(h))) {
+    event.respondWith(
+      caches.open(CACHE_NAME).then(cache =>
+        cache.match(event.request).then(cached => {
+          const fetchPromise = fetch(event.request).then(response => {
+            if (response.ok) {
+              cache.put(event.request, response.clone());
+            }
+            return response;
+          }).catch(() => cached);
+          return cached || fetchPromise;
+        })
+      )
+    );
+    return;
+  }
+
+  // Otros recursos: Network only
 });
