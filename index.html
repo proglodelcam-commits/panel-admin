@@ -95,7 +95,7 @@
 <script type="module">
   try{
     const { initializeApp } = await import('https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js');
-    const { getDatabase, ref, onValue, get, set, update, remove } = await import('https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js');
+    const { getDatabase, ref, onValue, get, set, update, remove, runTransaction } = await import('https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js');
     const { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged } = await import('https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js');
     const cfg={apiKey:'AIzaSyBfPmfE6axd_W0Z80b0L-Jbjy6q7l9_NTk',authDomain:'productos-globales-campo.firebaseapp.com',databaseURL:'https://productos-globales-campo-default-rtdb.firebaseio.com',projectId:'productos-globales-campo'};
     const _app=initializeApp(cfg);
@@ -117,6 +117,8 @@
       setAt:(path,obj)=>set(ref(db,path),obj),
       removeAt:(path)=>remove(ref(db,path)),
       pullNode:async(path)=>{ const s=await get(ref(db,path)); return s.val()||{}; },
+      /* Suma/resta atomica (para estrellas: evita contar doble) */
+      runTx:async(path,fn)=>{ const r=await runTransaction(ref(db,path),fn); return {committed:r.committed, snapshot:r.snapshot?r.snapshot.val():null}; },
       seedIfEmpty:async(obj)=>{ const s=await get(ref(db,'productos')); if(!s.exists()||!Object.keys(s.val()||{}).length){ await update(ref(db,'productos'),obj); return true;} return false; },
       nextRecibo:async()=>{ const r=ref(db,'meta/contador_recibo'); const s=await get(r); const n=s.exists()?parseInt(s.val()||1001):1001; await set(r,n+1); return String(n).padStart(7,'0'); },
       /* --- Autenticacion Firebase (Email/Password) para el administrador --- */
@@ -209,7 +211,7 @@ let PROMOS = (function(){ try{ const s=localStorage.getItem('pg_promos'); if(s){
 function savePromos(){ try{ localStorage.setItem('pg_promos',JSON.stringify(PROMOS)); }catch(e){} }
 /* Puntos otorgados según el monto de la compra (regla configurable) */
 function puntosPorMonto(sub){ const r=PROMOS.puntos||{cada:20,pts:1}; const cada=+r.cada||0, pts=+r.pts||0; if(cada<=0||pts<=0) return 0; return Math.floor((+sub||0)/cada)*pts; }
-function promoMonto(sub){ for(const t of PROMOS.montos){ if((+sub||0)>=t.min) return t; } return null; }
+function promoMonto(sub){ for(const t of PROMOS.montos){ if((+sub||0)>t.min) return t; } return null; }
 /* comprasPrevias = compras ya realizadas por el cliente (antes de ésta) */
 function esDecimaCompra(comprasPrevias){ const n=(+comprasPrevias||0)+1; return n>0 && n%PROMOS.decima.cada===0; }
 function calcPromos(sub, comprasPrevias){
@@ -219,7 +221,7 @@ function calcPromos(sub, comprasPrevias){
   const decima=esDecimaCompra(comprasPrevias);
   const decMonto=decima?+((sub-tierMonto)*PROMOS.decima.pct/100).toFixed(2):0;
   const tipos=[];
-  if(tier) tipos.push('Descuento por monto '+tier.pct+'% (compra ≥ '+money(tier.min)+')');
+  if(tier) tipos.push('Descuento por monto '+tier.pct+'% (compra de más de '+money(tier.min)+')');
   if(decima) tipos.push('Premio 10.ª compra '+PROMOS.decima.pct+'%');
   return { tier, tierPct:tier?tier.pct:0, tierMonto, decima, decPct:decima?PROMOS.decima.pct:0, decMonto, total:+(tierMonto+decMonto).toFixed(2), tipos };
 }
@@ -367,6 +369,7 @@ const MENU = [
   {id:'cupon',        t:'Cupón',             i:'fa-ticket'},
   {id:'promos',       t:'Promociones',       i:'fa-tags'},
   {id:'clientes',     t:'Clientes',          i:'fa-users'},
+  {id:'estrellas',    t:'Estrellas',         i:'fa-star'},
   {id:'transacciones',t:'Transacciones',     i:'fa-money-bill-transfer'},
   {id:'estadisticas', t:'Estadísticas',      i:'fa-chart-pie'},
   {id:'reportes',     t:'Reportes',          i:'fa-file-lines'},
@@ -382,9 +385,9 @@ let _fotoTmp=null;
 const ROLE_PERMS = {
   'Administrador': '*',
   'admin': '*',
-  'Ventas':     ['inicio','vender','pedidos','pendientes','catalogo','clientes','cupon','promos','transacciones'],
+  'Ventas':     ['inicio','vender','pedidos','pendientes','catalogo','clientes','estrellas','cupon','promos','transacciones'],
   'Inventario': ['inicio','inventario','pendientes','catalogo','anuncios','pedidos'],
-  'Finanzas':   ['inicio','finanzas','ingresos','cxc','transacciones','estadisticas','reportes']
+  'Finanzas':   ['inicio','finanzas','ingresos','cxc','transacciones','estadisticas','reportes','estrellas']
 };
 function rolActual(){ return (window.USUARIO_ACTUAL&&window.USUARIO_ACTUAL.rol)||'Administrador'; }
 function menuPermitido(){ const p=ROLE_PERMS[rolActual()]; if(p==='*'||!p) return MENU; return MENU.filter(m=>p.indexOf(m.id)>=0); }
@@ -655,6 +658,277 @@ RENDER.pendientes = function(){
 };
 function pedVer(v){ PED_VER=v; RENDER.pendientes(); }
 
+/* ============================================================
+   ESTRELLAS DE FIDELIDAD — control de pagos
+   Regla: la compra llega PENDIENTE y NO suma estrella.
+   El dueño confirma el pago -> se activa la estrella.
+   Si no paga o el pedido se cae -> se anula (nunca queda contada).
+   ============================================================ */
+let EST_FILTRO = 'pendiente';
+let EST_BUSCA = '';
+
+function _estFmtF(f){
+  if(!f) return '—';
+  try{
+    const d = new Date(f);
+    if(isNaN(d.getTime())) return String(f);
+    return d.toLocaleString('es-NI',{day:'2-digit',month:'2-digit',year:'2-digit',hour:'2-digit',minute:'2-digit'});
+  }catch(e){ return String(f); }
+}
+
+function bannerEstrellas(){
+  const n = ESTRELLAS.filter(function(e){ return e.estado==='pendiente'; }).length;
+  if(!n) return '';
+  return `<div class="rounded-2xl mb-5 px-4 py-3 flex flex-wrap items-center gap-3" style="background:#fff8e6;border:1px solid #e3c98a">
+    <span style="font-size:20px">⭐</span>
+    <div class="flex-1 min-w-[200px]"><b class="text-pg-green">${n} compra${n===1?'':'s'} esperando que confirmés el pago</b>
+      <div class="text-[12px] text-pg-muted">Mientras no confirmés, esas estrellas no se suman a la tarjeta del cliente.</div></div>
+    <button onclick="go('estrellas')" class="px-3 py-2 rounded-lg bg-pg-green text-white text-xs font-semibold">Revisar estrellas</button>
+  </div>`;
+}
+
+RENDER.estrellas = function(){
+  const pend = ESTRELLAS.filter(function(e){ return e.estado==='pendiente'; });
+  const act  = ESTRELLAS.filter(function(e){ return e.estado==='activa'; });
+  const anu  = ESTRELLAS.filter(function(e){ return e.estado==='anulada'; });
+  const montoPend = pend.reduce(function(s,e){ return s + (+e.monto||0); }, 0);
+
+  let lista = ESTRELLAS.slice();
+  if(EST_FILTRO==='pendiente') lista = pend.slice();
+  else if(EST_FILTRO==='activa') lista = act.slice();
+  else if(EST_FILTRO==='anulada') lista = anu.slice();
+  const q = EST_BUSCA.trim().toLowerCase();
+  if(q) lista = lista.filter(function(e){ return (e.nombre+' '+e.tel+' '+e.recibo+' '+e.origen).toLowerCase().indexOf(q)>=0; });
+  if(lista.length>60) lista = lista.slice(0,60);
+
+  const rows = lista.map(function(e){
+    const st = e.estado==='activa'
+      ? '<span class="text-[11px] px-2 py-0.5 rounded-full bg-green-100 text-green-700"><i class="fa-solid fa-star mr-1"></i>Activada</span>'
+      : (e.estado==='anulada'
+        ? '<span class="text-[11px] px-2 py-0.5 rounded-full bg-red-100 text-red-700"><i class="fa-solid fa-ban mr-1"></i>Anulada</span>'
+        : '<span class="text-[11px] px-2 py-0.5 rounded-full bg-amber-100 text-amber-800"><i class="fa-solid fa-hourglass-half mr-1"></i>Pendiente</span>');
+    const btns = e.estado==='pendiente'
+      ? `<button onclick="activarEstrella('${e.tel}','${e.key}','${e.src||'compras'}')" class="text-[11px] px-2 py-1 rounded-md bg-pg-green text-white mr-1" title="Confirmar pago y activar"><i class="fa-solid fa-star"></i> Activar</button>
+         <button onclick="anularEstrella('${e.tel}','${e.key}','${e.src||'compras'}')" class="text-[11px] px-2 py-1 rounded-md bg-red-600 text-white" title="No pagó o pedido cancelado"><i class="fa-solid fa-ban"></i> Quitar</button>`
+      : (e.estado==='activa'
+        ? `<button onclick="anularEstrella('${e.tel}','${e.key}','${e.src||'compras'}')" class="text-[11px] px-2 py-1 rounded-md bg-red-600 text-white" title="Eliminar estrella ya activada"><i class="fa-solid fa-trash"></i> Eliminar</button>`
+        : `<button onclick="reactivarEstrella('${e.tel}','${e.key}','${e.src||'compras'}')" class="text-[11px] px-2 py-1 rounded-md bg-gray-200 text-gray-700" title="Volver a pendiente"><i class="fa-solid fa-rotate-left"></i> Revisar otra vez</button>`);
+    const motivo = e.motivo ? `<div class="text-[10px] text-pg-muted mt-1">${esc(e.motivo)}</div>` : '';
+    const cuando = e.estado==='activa' ? ('Activada: '+_estFmtF(e.activadaEn)) : (e.estado==='anulada' ? 'Anulada' : 'Recibida: '+_estFmtF(e.fecha));
+    return `<tr class="border-b border-gray-100 align-top hover:bg-pg-cream/60">
+      <td class="px-3 py-2"><b class="text-pg-green">${esc(e.nombre)}</b><div class="text-[10px] text-pg-muted">${esc(e.tel)}</div></td>
+      <td class="px-3 py-2 text-[11px]">${esc(e.origen)}<div class="text-[10px] text-pg-muted">Pedido ${esc(e.recibo)}${e.modo?(' · '+esc(e.modo)):''}</div></td>
+      <td class="px-3 py-2 text-right font-semibold">${money(e.monto)}</td>
+      <td class="px-3 py-2 text-[11px] text-pg-muted">${cuando}${motivo}</td>
+      <td class="px-3 py-2 text-center">${st}</td>
+      <td class="px-3 py-2 text-center whitespace-nowrap">${btns}</td></tr>`;
+  }).join('');
+
+  const card = function(v,label,val,color){
+    return `<button onclick="estFiltro('${v}')" class="text-left bg-white rounded-xl shadow-soft px-4 py-3 border-2 ${EST_FILTRO===v?'border-pg-green':'border-transparent'}">
+      <span class="text-[11px] text-pg-muted">${label}</span><br><b class="text-xl ${color}">${val}</b></button>`;
+  };
+
+  document.getElementById('view-estrellas').innerHTML = `
+  <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
+    ${card('pendiente','Por confirmar', pend.length, 'text-amber-700')}
+    ${card('activa','Activadas', act.length, 'text-pg-green')}
+    ${card('anulada','Anuladas', anu.length, 'text-red-600')}
+    <div class="bg-white rounded-xl shadow-soft px-4 py-3"><span class="text-[11px] text-pg-muted">Dinero en revisión</span><br><b class="text-xl text-pg-gold2">${money(montoPend)}</b></div>
+  </div>
+  <div class="bg-white rounded-2xl shadow-soft">
+    <div class="px-4 py-3 border-b border-gray-100 flex flex-wrap items-center gap-2">
+      <h3 class="font-bold text-pg-green mr-auto"><i class="fa-solid fa-star text-pg-gold mr-2"></i>Estrellas de fidelidad</h3>
+      <input value="${esc(EST_BUSCA)}" oninput="estBuscar(this.value)" placeholder="Buscar cliente, teléfono o pedido…" class="px-3 py-1.5 rounded-lg border border-gray-200 text-[12px] w-56 focus:outline-none focus:border-pg-gold">
+      <button onclick="estrellaManual()" class="px-3 py-1.5 rounded-lg bg-pg-gold text-white text-[12px] font-semibold"><i class="fa-solid fa-plus mr-1"></i>Estrella manual</button>
+    </div>
+    <div class="overflow-x-auto"><table class="w-full text-sm">
+      <thead class="bg-pg-cream text-pg-muted text-[11px] uppercase"><tr>
+        <th class="px-3 py-2 text-left">Cliente</th><th class="px-3 py-2 text-left">Origen</th><th class="px-3 py-2 text-right">Monto</th><th class="px-3 py-2 text-left">Fecha</th><th class="px-3 py-2 text-center">Estado</th><th class="px-3 py-2 text-center">Acción</th>
+      </tr></thead>
+      <tbody>${rows||'<tr><td colspan=6 class="text-center py-10 text-pg-muted"><i class="fa-regular fa-star text-2xl block mb-2"></i>No hay estrellas en esta lista</td></tr>'}</tbody>
+    </table></div>
+  </div>
+  <p class="text-[11px] text-pg-muted mt-3"><i class="fa-solid fa-circle-info mr-1"></i>La estrella se suma <b>solo</b> cuando confirmás el pago. Si el pedido se cae o no pagan, quitala: así el cliente no llega a la 10.ª compra con estrellas que no existen.</p>`;
+};
+function estFiltro(v){ EST_FILTRO=v; RENDER.estrellas(); }
+function estBuscar(v){ EST_BUSCA=String(v||''); RENDER.estrellas(); }
+
+/* Cada estrella sabe de donde viene: 'compras' = campo estrella dentro de la
+   compra (fuente principal y segura), 'pend' = nodo estrellas_pendientes
+   (compatibilidad + estrella manual). */
+function _estPath(tel,key,src){
+  return (src==='pend')
+    ? 'clientes/'+tel+'/estrellas_pendientes/'+key
+    : 'clientes/'+tel+'/compras/'+key;
+}
+function _estKeys(src){
+  return (src==='pend')
+    ? {estado:'estado', activadaEn:'activadaEn', activadaPor:'activadaPor', anuladaEn:'anuladaEn', anuladaPor:'anuladaPor', motivo:'motivo'}
+    : {estado:'estrella', activadaEn:'estrella_activadaEn', activadaPor:'estrella_activadaPor', anuladaEn:'estrella_anuladaEn', anuladaPor:'estrella_anuladaPor', motivo:'estrella_motivo'};
+}
+function _estFind(tel,key,src){
+  return ESTRELLAS.find(function(x){ return x.tel===tel && x.key===key && (x.src||'compras')===(src||'compras'); });
+}
+function _yo(){ return (window.USUARIO_ACTUAL&&(window.USUARIO_ACTUAL.nombre||window.USUARIO_ACTUAL.usuario))||'Administrador'; }
+
+/* Marca el estado de una estrella en la nube (una sola ruta por campo, para no
+   tocar el resto de la compra). */
+async function _estMark(e, estado, motivo){
+  const base = _estPath(e.tel,e.key,e.src), K = _estKeys(e.src), now = new Date().toISOString();
+  await window.PGSync.setAt(base+'/'+K.estado, estado);
+  if(estado==='activa'){
+    await window.PGSync.setAt(base+'/'+K.activadaEn, now);
+    await window.PGSync.setAt(base+'/'+K.activadaPor, _yo());
+    await window.PGSync.setAt(base+'/'+K.motivo, '');
+  } else if(estado==='anulada'){
+    await window.PGSync.setAt(base+'/'+K.anuladaEn, now);
+    await window.PGSync.setAt(base+'/'+K.anuladaPor, _yo());
+    await window.PGSync.setAt(base+'/'+K.motivo, motivo||'Sin motivo');
+  } else {
+    await window.PGSync.setAt(base+'/'+K.motivo, '');
+  }
+}
+
+/* Suma 1 compra confirmada y el monto: SOLO con el pago verificado. */
+async function _estSumar(e){
+  const t1 = await window.PGSync.runTx('clientes/'+e.tel+'/total_compras', function(v){ return (parseInt(v||0)||0)+1; });
+  if(!t1.committed) throw new Error('No se pudo sumar la compra');
+  await window.PGSync.runTx('clientes/'+e.tel+'/monto_total', function(v){ return +(((parseFloat(v||0)||0)+(+e.monto||0)).toFixed(2)); });
+}
+async function _estRestar(e){
+  await window.PGSync.runTx('clientes/'+e.tel+'/total_compras', function(v){ return Math.max(0,(parseInt(v||0)||0)-1); });
+  await window.PGSync.runTx('clientes/'+e.tel+'/monto_total', function(v){ return Math.max(0,+(((parseFloat(v||0)||0)-(+e.monto||0)).toFixed(2))); });
+}
+
+/* Activacion silenciosa por numero de pedido (usada al entregar un pedido).
+   Devuelve la estrella activada o null si no habia nada pendiente. */
+async function activarEstrellaPorRecibo(recibo){
+  try{
+    if(!(window.PGSync&&window.PGSync.ok)) return null;
+    const e = ESTRELLAS.find(function(x){ return x.estado==='pendiente' && (x.recibo===recibo||x.pedido===recibo); });
+    if(!e) return null;
+    const base = _estPath(e.tel,e.key,e.src), K = _estKeys(e.src);
+    const cur = (await window.PGSync.pullNode(base))||{};
+    if(String(cur[K.estado]||'')!=='pendiente') return null;
+    await _estMark(e,'activa','');
+    try{
+      await _estSumar(e);
+    }catch(err){
+      try{ await _estMark(e,'pendiente',''); }catch(e2){}
+      return null;
+    }
+    return e;
+  }catch(err){ return null; }
+}
+
+/* Anulacion automatica cuando el pedido se cancela (no paga / se cae). */
+async function anularEstrellaPorRecibo(recibo, motivo){
+  try{
+    if(!(window.PGSync&&window.PGSync.ok)) return null;
+    const e = ESTRELLAS.find(function(x){ return x.estado==='pendiente' && (x.recibo===recibo||x.pedido===recibo); });
+    if(!e) return null;
+    await _estMark(e,'anulada', motivo||'Pedido cancelado');
+    return e;
+  }catch(err){ return null; }
+}
+
+async function activarEstrella(tel,key,src){
+  const e = _estFind(tel,key,src);
+  if(!e) return toast('No se encontró esa estrella');
+  if(!(window.PGSync&&window.PGSync.ok)) return toast('Sin conexión a la nube: no se puede activar');
+  if(!confirm('¿Confirmás que el pago de '+e.nombre+' por '+money(e.monto)+' (pedido '+e.recibo+') ya entró?\n\nAl confirmar se suma 1 estrella a su tarjeta.')) return;
+  const base = _estPath(tel,key,e.src), K = _estKeys(e.src);
+  try{
+    const cur = (await window.PGSync.pullNode(base))||{};
+    if(String(cur[K.estado]||'')==='activa'){ toast('Esa estrella ya estaba activada'); refrescar(); return; }
+    await _estMark(e,'activa','');
+    try{
+      await _estSumar(e);
+    }catch(err){
+      try{ await _estMark(e,'pendiente',''); }catch(e2){}
+      throw err;
+    }
+  }catch(err){
+    toast('No se pudo activar: '+((err&&err.message)||'error de red'));
+    refrescar(); return;
+  }
+  toast('Estrella activada para '+e.nombre);
+  refrescar();
+}
+
+async function anularEstrella(tel,key,src){
+  const e = _estFind(tel,key,src);
+  if(!e) return toast('No se encontró esa estrella');
+  if(!(window.PGSync&&window.PGSync.ok)) return toast('Sin conexión a la nube');
+  const base = _estPath(tel,key,e.src), K = _estKeys(e.src);
+  let cur = {};
+  try{ cur = (await window.PGSync.pullNode(base))||{}; }
+  catch(err){ return toast('Sin conexión a la nube: no se pudo leer la estrella'); }
+  const estadoNube = String(cur[K.estado]||'');
+  if(estadoNube==='anulada'){ toast('Esa estrella ya estaba anulada'); refrescar(); return; }
+  const yaActiva = (estadoNube==='activa');
+  const motivo = prompt(yaActiva
+      ? 'Vas a ELIMINAR una estrella ya activada de '+e.nombre+' ('+money(e.monto)+').\nEscribí el motivo:'
+      : 'Quitar la estrella de '+e.nombre+' ('+money(e.monto)+') porque no pagó o el pedido se cayó.\nEscribí el motivo:', 'No pagó / pedido cancelado');
+  if(motivo===null) return;
+  try{
+    await _estMark(e,'anulada', motivo||'Sin motivo');
+    if(yaActiva) await _estRestar(e);
+  }catch(err){
+    toast('No se pudo anular: '+((err&&err.message)||'error de red'));
+    refrescar(); return;
+  }
+  toast(yaActiva ? 'Estrella eliminada y descontada' : 'Estrella anulada: no se suma');
+  refrescar();
+}
+
+async function reactivarEstrella(tel,key,src){
+  const e = _estFind(tel,key,src);
+  if(!e) return toast('No se encontró esa estrella');
+  if(!confirm('¿Volver a dejar esta estrella como PENDIENTE para revisarla otra vez?')) return;
+  try{
+    await _estMark(e,'pendiente','');
+    toast('Estrella de vuelta en pendientes'); refrescar();
+  }catch(e2){ toast('No se pudo cambiar'); }
+}
+
+function estrellaManual(){
+  openModal(`<div class="p-5">
+    <div class="flex items-center justify-between mb-4"><h3 class="font-bold text-pg-green"><i class="fa-solid fa-star text-pg-gold mr-2"></i>Dar una estrella manual</h3><button onclick="closeModal()" class="text-pg-muted"><i class="fa-solid fa-xmark"></i></button></div>
+    <p class="text-[12px] text-pg-muted mb-3">Para ventas hechas en persona o pagos que ya verificaste en tu cuenta. Se activa de una vez.</p>
+    <label class="text-xs font-semibold">WhatsApp del cliente (solo números)</label>
+    <input id="emTel" class="w-full mt-1 mb-3 px-3 py-2 rounded-lg border border-gray-200 text-sm" placeholder="50557973097">
+    <label class="text-xs font-semibold">Nombre</label>
+    <input id="emNom" class="w-full mt-1 mb-3 px-3 py-2 rounded-lg border border-gray-200 text-sm" placeholder="Cliente">
+    <label class="text-xs font-semibold">Monto de la compra (C$)</label>
+    <input id="emMonto" type="number" min="0" class="w-full mt-1 mb-3 px-3 py-2 rounded-lg border border-gray-200 text-sm" placeholder="0.00">
+    <div class="flex gap-2 mt-2"><button onclick="closeModal()" class="flex-1 py-2.5 rounded-lg bg-gray-100 text-sm font-semibold">Cancelar</button><button onclick="guardarEstrellaManual()" class="flex-1 py-2.5 rounded-lg bg-pg-green text-white text-sm font-semibold">Activar estrella</button></div>
+  </div>`);
+}
+
+async function guardarEstrellaManual(){
+  const tel = String((document.getElementById('emTel')||{}).value||'').replace(/\D/g,'');
+  const nom = String((document.getElementById('emNom')||{}).value||'').trim();
+  const monto = parseFloat((document.getElementById('emMonto')||{}).value)||0;
+  if(tel.length<8) return toast('Poné el WhatsApp completo del cliente');
+  if(!(window.PGSync&&window.PGSync.ok)) return toast('Sin conexión a la nube');
+  const id = 'manual_'+Date.now();
+  const eMan = {src:'pend', key:id, tel:tel, monto:monto};
+  const base = _estPath(tel,id,'pend');
+  try{
+    await window.PGSync.setAt(base, {id:id, tel:tel, nombre:nom||'Cliente', monto:monto, fecha:new Date().toISOString(),
+      estado:'activa', activadaEn:new Date().toISOString(), activadaPor:_yo(),
+      origen:'Panel (manual)', recibo:'MANUAL-'+String(new Date().getTime()).slice(-6), pedido:id, modo:'manual', metodo:'N/A'});
+    await window.PGSync.setAt('clientes/'+tel+'/nombre', nom||'Cliente');
+    await _estSumar(eMan);
+    closeModal();
+    toast('Estrella activada para '+(nom||'el cliente'));
+    refrescar();
+  }catch(e2){ toast('No se pudo guardar la estrella'); }
+}
+
+
 function refrescar(){ if(typeof VISTA==='undefined'||!document.getElementById('view-'+VISTA)) return; if(typeof applyEntregas==='function') applyEntregas(); if(typeof applyCancelaciones==='function') applyCancelaciones(); if(RENDER[VISTA]) RENDER[VISTA](); }
 function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
@@ -687,6 +961,7 @@ RENDER.inicio = function(){
       <td class="px-3 py-2 text-center whitespace-nowrap"><button onclick="abrirFacturaKyte('${p.recibo}')" class="text-[11px] px-2 py-1 rounded-md ${numFacturaDe(p.recibo)?'bg-blue-100 text-blue-700':'bg-blue-600 text-white hover:bg-blue-700'} mr-1" title="Facturar en Kyte"><i class="fa-solid fa-file-invoice"></i></button><button onclick="reciboPedido('${p.recibo}')" class="text-[11px] px-2 py-1 rounded-md bg-pg-gold text-white hover:bg-pg-gold2 mr-1"><i class="fa-solid fa-receipt"></i></button><button onclick="entregarPedido('${p.recibo}')" class="text-[11px] px-2 py-1 rounded-md bg-pg-green text-white hover:bg-pg-green2 mr-1"><i class="fa-solid fa-check"></i></button><button onclick="cancelarPedido('${p.recibo}')" class="text-[11px] px-2 py-1 rounded-md bg-red-600 text-white hover:bg-red-700" title="Cancelar pedido"><i class="fa-solid fa-xmark"></i></button></td>
     </tr>`).join('');
   document.getElementById('view-inicio').innerHTML=`
+  ${bannerEstrellas()}
   ${bannerAlertaDecima()}
   <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5">
     <div class="kpi-bar bg-white rounded-2xl shadow-soft overflow-hidden">
@@ -761,15 +1036,21 @@ function entregarPedido(r){
       <input id="entAbono" type="number" min="0" max="${total}" value="0" class="w-full mt-1 px-3 py-2 rounded-lg border border-gray-200 text-sm focus:outline-none focus:border-pg-gold">
       <p class="text-[11px] text-pg-muted mt-1">El abono ingresa a Ingresos; el saldo restante queda en Cuentas por Cobrar del cliente.</p>
     </div>
+    <label class="flex items-start gap-2 p-3 rounded-lg border border-amber-200 bg-amber-50 cursor-pointer mt-3">
+      <input type="checkbox" id="entEstrella" checked class="mt-0.5">
+      <span class="text-[12px] text-pg-green"><b>⭐ Activar la estrella del cliente</b><br><span class="text-pg-muted">Marcalo solo si el pago ya está confirmado. Si lo dejás sin marcar, la estrella queda pendiente en el módulo Estrellas.</span></span>
+    </label>
     <div class="flex gap-2 mt-5"><button onclick="closeModal()" class="flex-1 py-2.5 rounded-lg bg-gray-100 text-sm font-semibold">Cancelar</button><button onclick="confirmarEntrega('${p.recibo}')" class="flex-1 py-2.5 rounded-lg bg-pg-green hover:bg-pg-green2 text-white text-sm font-semibold">Confirmar entrega</button></div>
   </div>`);
 }
-function _entToggle(){ const m=document.querySelector('input[name=entModo]:checked'); const box=document.getElementById('entAbonoBox'); if(box) box.classList.toggle('hidden', !(m&&m.value==='credito')); }
+function _entToggle(){ const m=document.querySelector('input[name=entModo]:checked'); const box=document.getElementById('entAbonoBox'); if(box) box.classList.toggle('hidden', !(m&&m.value==='credito'));
+  const chk=document.getElementById('entEstrella'); if(chk) chk.checked = !(m&&m.value==='credito'); }
 function confirmarEntrega(r){
   const p=PEDIDOS.find(x=>x.recibo===r); if(!p)return;
   const modo=(document.querySelector('input[name=entModo]:checked')||{}).value||'contado';
   const sh=+p.ship||0, total=Math.max(0,(+p.total||0)), idx=PEDIDOS.indexOf(p);
   const fISO=new Date().toISOString();
+  const pedirEstrella=!!((document.getElementById('entEstrella')||{}).checked);
   if(modo==='contado'){
     registrarEntrega({recibo:p.recibo,modo:'contado',total:total,abono:total,saldo:0,cliente:p.cliente,tel:p.tel||'',origen:p.origen,metodo:'Contado',ship:sh,fecha:fechaHora(),fechaISO:fISO});
     if(idx>=0) PEDIDOS.splice(idx,1);
@@ -785,6 +1066,9 @@ function confirmarEntrega(r){
       registrarAbono({cliente:p.cliente,tel:p.tel||'',monto:abono,refFactura:p.recibo,fecha:fechaHora(),fechaISO:fISO});
       abrirRecibo({docTipo:'Factura',recibo:'AB-'+p.recibo,tipo:'Abono a factura de cr\u00e9dito '+p.recibo,cliente:p.cliente,tel:p.tel||'',fecha:fechaHora(),metodo:'Abono',lineas:[{desc:'Abono a factura '+p.recibo,cant:1,precio:abono}],subtotal:abono,ship:0,total:abono,saldoPendiente:saldo});
     }
+  }
+  if(pedirEstrella){
+    activarEstrellaPorRecibo(p.recibo).then(function(e){ if(e) toast('⭐ Estrella activada para '+e.nombre); });
   }
 }
 
@@ -1299,7 +1583,7 @@ function ventasHoy(){ const hoy=todayISO(); return VENTAS.filter(v=>{ const iso=
 function totalVentasHoyDetalle(){ return ventasHoy().reduce((s,v)=>s+(+v.total||0),0); }
 function registrarCancelacion(rec){ if(!rec||!rec.recibo)return; CANCELADOS[rec.recibo]=rec; saveCancelados(); if(window.PGSync&&window.PGSync.ok&&window.PGSync.setAt){ try{ window.PGSync.setAt('pedidos_estado/'+rec.recibo,{estado:'Cancelado'}); }catch(e){} } }
 function applyCancelaciones(){ PEDIDOS=PEDIDOS.filter(p=>!CANCELADOS[p.recibo]); }
-function cancelarPedido(r){ const p=PEDIDOS.find(x=>x.recibo===r); if(!p)return; if(!confirm('¿Cancelar el pedido '+r+'? Ya no aparecerá en pendientes.'))return; registrarCancelacion({recibo:p.recibo,cliente:p.cliente||'',origen:p.origen||'',fecha:fechaHora()}); const idx=PEDIDOS.indexOf(p); if(idx>=0) PEDIDOS.splice(idx,1); refrescar(); toast('Pedido '+r+' cancelado'); }
+function cancelarPedido(r){ const p=PEDIDOS.find(x=>x.recibo===r); if(!p)return; if(!confirm('¿Cancelar el pedido '+r+'? Ya no aparecerá en pendientes y su estrella se anula.'))return; registrarCancelacion({recibo:p.recibo,cliente:p.cliente||'',origen:p.origen||'',fecha:fechaHora()}); const idx=PEDIDOS.indexOf(p); if(idx>=0) PEDIDOS.splice(idx,1); refrescar(); toast('Pedido '+r+' cancelado'); anularEstrellaPorRecibo(p.recibo,'Pedido cancelado en el panel').then(function(e){ if(e) toast('⭐ Se anuló la estrella pendiente de '+e.nombre); }); }
 function saldoEntregasCliente(nombre){ let s=0; Object.values(ENTREGAS).forEach(r=>{ if(r&&r.modo==='credito'&&r.cliente===nombre) s+=(+r.saldo||0); }); return +s.toFixed(2); }
 /* Recalcula (idempotente) los efectos de las entregas: retira los pedidos entregados
    de Inicio/Pedidos, deriva los ingresos (contado y abonos) y suma el saldo de crédito a CxC. */
@@ -1335,15 +1619,56 @@ function mergeCloudProductos(data){
   if(ids.length){ PRODUCTOS=ids.map(id=>cloudToProd(id,CLOUD.productos[id])); }
 }
 
+/* Estrellas de fidelidad: la compra nace con estrella='pendiente' dentro de
+   clientes/{tel}/compras/{id} y suma recien cuando el negocio confirma el pago
+   desde el panel. Las compras viejas (sin campo estrella) NO aparecen: ya estaban
+   contadas. Tambien se leen estrellas_pendientes por compatibilidad y para la
+   estrella manual. Ver vista "Estrellas". */
+let ESTRELLAS=[];
+const EST_ESTADOS = {pendiente:1, activa:1, anulada:1};
 function mergeCloudClientes(data){
   CLOUD.clientes=data||{};
+  ESTRELLAS=[];
   Object.keys(CLOUD.clientes).forEach(tel=>{
     const c=CLOUD.clientes[tel]||{};
     let ex=CLIENTES.find(x=>x.cloudKey===tel||x.tel===tel);
     const compras=+c.total_compras||0, puntos=Math.round((+c.monto_total||0)/20);
     if(!ex){ CLIENTES.push({ id:'C'+tel, cloudKey:tel, nombre:c.nombre||'Cliente en linea', tel:String(tel), tarjeta:cloudClientCode(tel), puntos, compras, saldo:0, online:true }); }
     else { ex.cloudKey=tel; if(c.nombre) ex.nombre=c.nombre; ex.compras=Math.max(ex.compras||0,compras); ex.puntos=Math.max(ex.puntos||0,puntos); }
+
+    /* 1) Fuente principal: el campo estrella de cada compra */
+    const cp=c.compras||{};
+    Object.keys(cp).forEach(k=>{
+      const e=cp[k]; if(!e||typeof e!=='object') return;
+      const est=String(e.estrella||'');
+      if(!EST_ESTADOS[est]) return;
+      ESTRELLAS.push({
+        src:'compras', key:k, id:e.id||k, tel:String(tel),
+        nombre:c.nombre||'Cliente',
+        monto:+(e.estrella_monto!=null?e.estrella_monto:(e.total||0))||0,
+        fecha:e.estrella_fecha||e.fecha||'',
+        estado:est, activadaEn:e.estrella_activadaEn||'', activadaPor:e.estrella_activadaPor||'',
+        motivo:e.estrella_motivo||'',
+        origen:e.estrella_origen||e.origen||'Tienda en Línea',
+        recibo:e.numero_recibo||e.recibo||k, pedido:e.numero_recibo||k,
+        modo:e.tipo||'', metodo:e.metodo_pago||''
+      });
+    });
+
+    /* 2) Compatibilidad: nodo estrellas_pendientes (estrella manual incluida) */
+    const ep=c.estrellas_pendientes||{};
+    Object.keys(ep).forEach(k=>{
+      const e=ep[k]; if(!e||typeof e!=='object') return;
+      ESTRELLAS.push({
+        src:'pend', key:k, id:e.id||k, tel:String(e.tel||tel), nombre:e.nombre||c.nombre||'Cliente',
+        monto:+e.monto||0, fecha:e.fecha||'', estado:e.estado||'pendiente',
+        origen:e.origen||'Tienda en Línea', recibo:e.recibo||e.pedido||k, pedido:e.pedido||k,
+        modo:e.modo||'', metodo:e.metodo||'', activadaEn:e.activadaEn||'', activadaPor:e.activadaPor||'',
+        motivo:e.motivo||''
+      });
+    });
   });
+  ESTRELLAS.sort((a,b)=>String(b.fecha).localeCompare(String(a.fecha)));
 }
 
 function mergeCloudCxc(data){
