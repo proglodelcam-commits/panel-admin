@@ -801,6 +801,44 @@ async function _estRestar(e){
   await window.PGSync.runTx('clientes/'+e.tel+'/monto_total', function(v){ return Math.max(0,+(((parseFloat(v||0)||0)-(+e.monto||0)).toFixed(2))); });
 }
 
+
+/* ===== Pase de Google Wallet: que nunca quede desfasado =====
+   Cada vez que una estrella se activa o se anula se vuelve a calcular lo que
+   debe mostrar el pase (estrellas y compras confirmadas) y se manda al mismo
+   endpoint que usan la tienda y la tarjeta. Asi, si un pedido se cancela y su
+   estrella se quita, el pase del cliente baja igual que la tarjeta.
+   Es "disparar y olvidar": si el endpoint no responde, el panel sigue igual. */
+var PG_WALLET_EP = 'https://script.google.com/macros/s/AKfycbzj7JwoWoUV87l5bI7RB6YtYhwfG49dD-m_7Ur_053rXwtWMHEp7TyhgrmzD5NGQYvq/exec';
+async function _walletSync(telRaw){
+  try{
+    var tel = String(telRaw||'').replace(/\D/g,'');
+    if(tel.length < 8) return;
+    if(!(window.PGSync && window.PGSync.ok)) return;
+    var total = 0;
+    try{ total = parseInt(await window.PGSync.pullNode('clientes/'+tel+'/total_compras'))||0; }catch(e){ total = 0; }
+    var N = 10;
+    try{
+      var cfg = (await window.PGSync.pullNode('config/fidelidad'))||{};
+      var n = parseInt(cfg.comprasPorPremio||cfg.compras_por_premio||0)||0;
+      if(n > 0) N = n;
+    }catch(e){}
+    var estr = N > 0 ? (total % N) : 0;
+    if(estr === 0 && total > 0) estr = N;
+    var cb = 'gwupd_' + Date.now() + '_' + Math.floor(Math.random()*1e6);
+    var s = document.createElement('script');
+    function clean(){ try{ delete window[cb]; }catch(_e){ window[cb] = undefined; } if(s && s.parentNode){ s.parentNode.removeChild(s); } clearTimeout(tm); }
+    var tm = setTimeout(clean, 20000);
+    window[cb] = function(){ clean(); };
+    s.onerror = function(){ clean(); };
+    s.src = PG_WALLET_EP + '?action=update' +
+            '&tel=' + encodeURIComponent(tel) +
+            '&estrellas=' + estr +
+            '&compras=' + total +
+            '&callback=' + cb;
+    document.body.appendChild(s);
+  }catch(e){}
+}
+
 /* Activacion silenciosa por numero de pedido (usada al entregar un pedido).
    Devuelve la estrella activada o null si no habia nada pendiente. */
 async function activarEstrellaPorRecibo(recibo){
@@ -818,6 +856,7 @@ async function activarEstrellaPorRecibo(recibo){
       try{ await _estMark(e,'pendiente',''); }catch(e2){}
       return null;
     }
+    _walletSync(e.tel);
     return e;
   }catch(err){ return null; }
 }
@@ -826,9 +865,21 @@ async function activarEstrellaPorRecibo(recibo){
 async function anularEstrellaPorRecibo(recibo, motivo){
   try{
     if(!(window.PGSync&&window.PGSync.ok)) return null;
-    const e = ESTRELLAS.find(function(x){ return x.estado==='pendiente' && (x.recibo===recibo||x.pedido===recibo); });
+    const e = ESTRELLAS.find(function(x){ return (x.estado==='pendiente'||x.estado==='activa') && (x.recibo===recibo||x.pedido===recibo); });
     if(!e) return null;
+    const base = _estPath(e.tel,e.key,e.src), K = _estKeys(e.src);
+    const cur = (await window.PGSync.pullNode(base))||{};
+    const estadoNube = String(cur[K.estado]||e.estado||'');
+    if(estadoNube==='anulada') return null;
     await _estMark(e,'anulada', motivo||'Pedido cancelado');
+    /* Si la estrella YA estaba activa (pago confirmado o pedido entregado),
+       hay que descontarla. Si no, el cliente se queda con una estrella de un
+       pedido que despues se cancelo. */
+    e.restada = false;
+    if(estadoNube==='activa'){
+      try{ await _estRestar(e); e.restada = true; }catch(err){}
+    }
+    _walletSync(e.tel);
     return e;
   }catch(err){ return null; }
 }
@@ -853,6 +904,7 @@ async function activarEstrella(tel,key,src){
     toast('No se pudo activar: '+((err&&err.message)||'error de red'));
     refrescar(); return;
   }
+  _walletSync(tel);
   toast('Estrella activada para '+e.nombre);
   refrescar();
 }
@@ -879,7 +931,8 @@ async function anularEstrella(tel,key,src){
     toast('No se pudo anular: '+((err&&err.message)||'error de red'));
     refrescar(); return;
   }
-  toast(yaActiva ? 'Estrella eliminada y descontada' : 'Estrella anulada: no se suma');
+  _walletSync(tel);
+  toast(yaActiva ? 'Estrella eliminada, descontada y pase actualizado' : 'Estrella anulada: no se suma y el pase queda igual');
   refrescar();
 }
 
@@ -923,6 +976,7 @@ async function guardarEstrellaManual(){
     await window.PGSync.setAt('clientes/'+tel+'/nombre', nom||'Cliente');
     await _estSumar(eMan);
     closeModal();
+    _walletSync(tel);
     toast('Estrella activada para '+(nom||'el cliente'));
     refrescar();
   }catch(e2){ toast('No se pudo guardar la estrella'); }
@@ -1064,7 +1118,7 @@ function confirmarEntrega(r){
     closeModal(); refrescar(); toast('Pedido '+r+' entregado a cr\u00e9dito \u00b7 saldo '+money(saldo)+' a CxC');
     if(abono>0){
       registrarAbono({cliente:p.cliente,tel:p.tel||'',monto:abono,refFactura:p.recibo,fecha:fechaHora(),fechaISO:fISO});
-      abrirRecibo({docTipo:'Factura',recibo:'AB-'+p.recibo,tipo:'Abono a factura de cr\u00e9dito '+p.recibo,cliente:p.cliente,tel:p.tel||'',fecha:fechaHora(),metodo:'Abono',lineas:[{desc:'Abono a factura '+p.recibo,cant:1,precio:abono}],subtotal:abono,ship:0,total:abono,saldoPendiente:saldo});
+      abrirRecibo({docTipo:'Recibo de abono',recibo:p.recibo,factura:numFacturaDe(p.recibo)||'',tipo:'Abono al pedido '+p.recibo+' (venta a cr\u00e9dito)',cliente:p.cliente,tel:p.tel||'',fecha:fechaHora(),metodo:'Abono',lineas:[{desc:'Abono al pedido '+p.recibo,cant:1,precio:abono}],subtotal:abono,ship:0,total:abono,saldoPendiente:saldo});
     }
   }
   if(pedirEstrella){
@@ -1583,7 +1637,7 @@ function ventasHoy(){ const hoy=todayISO(); return VENTAS.filter(v=>{ const iso=
 function totalVentasHoyDetalle(){ return ventasHoy().reduce((s,v)=>s+(+v.total||0),0); }
 function registrarCancelacion(rec){ if(!rec||!rec.recibo)return; CANCELADOS[rec.recibo]=rec; saveCancelados(); if(window.PGSync&&window.PGSync.ok&&window.PGSync.setAt){ try{ window.PGSync.setAt('pedidos_estado/'+rec.recibo,{estado:'Cancelado'}); }catch(e){} } }
 function applyCancelaciones(){ PEDIDOS=PEDIDOS.filter(p=>!CANCELADOS[p.recibo]); }
-function cancelarPedido(r){ const p=PEDIDOS.find(x=>x.recibo===r); if(!p)return; if(!confirm('¿Cancelar el pedido '+r+'? Ya no aparecerá en pendientes y su estrella se anula.'))return; registrarCancelacion({recibo:p.recibo,cliente:p.cliente||'',origen:p.origen||'',fecha:fechaHora()}); const idx=PEDIDOS.indexOf(p); if(idx>=0) PEDIDOS.splice(idx,1); refrescar(); toast('Pedido '+r+' cancelado'); anularEstrellaPorRecibo(p.recibo,'Pedido cancelado en el panel').then(function(e){ if(e) toast('⭐ Se anuló la estrella pendiente de '+e.nombre); }); }
+function cancelarPedido(r){ const p=PEDIDOS.find(x=>x.recibo===r); if(!p)return; if(!confirm('¿Cancelar el pedido '+r+'? Ya no aparecerá en pendientes y su estrella se anula.'))return; registrarCancelacion({recibo:p.recibo,cliente:p.cliente||'',origen:p.origen||'',fecha:fechaHora()}); const idx=PEDIDOS.indexOf(p); if(idx>=0) PEDIDOS.splice(idx,1); refrescar(); toast('Pedido '+r+' cancelado'); anularEstrellaPorRecibo(p.recibo,'Pedido cancelado en el panel').then(function(e){ if(e){ toast(e.restada ? ('⭐ Estrella de '+e.nombre+' anulada y descontada') : ('⭐ Se anuló la estrella pendiente de '+e.nombre)); } if(p.tel) _walletSync(p.tel); }); }
 function saldoEntregasCliente(nombre){ let s=0; Object.values(ENTREGAS).forEach(r=>{ if(r&&r.modo==='credito'&&r.cliente===nombre) s+=(+r.saldo||0); }); return +s.toFixed(2); }
 /* Recalcula (idempotente) los efectos de las entregas: retira los pedidos entregados
    de Inicio/Pedidos, deriva los ingresos (contado y abonos) y suma el saldo de crédito a CxC. */
@@ -2040,7 +2094,7 @@ function reciboHTML(d){
   const logoTag=(typeof LOGO_GOLD!=='undefined'&&LOGO_GOLD)?`<img src="${LOGO_GOLD}" style="width:56px;height:56px;border-radius:50%;object-fit:cover;margin-bottom:6px">`:`<div class="lg">&#127793;<\/div>`;
   const cliBlock=`<div class="cli"><b>Cliente:<\/b> ${d.cliente||'Mostrador'}${d.tel?'<br><b>Tel:<\/b> '+d.tel:''}${d.dir?'<br><b>Dirección:<\/b> '+d.dir:''}<\/div>`;
   const convNota=d.convenir?`<p style="text-align:center;color:#a9781f;font-size:10px;margin:6px 0 0">* Costo de envío a convenir con el cliente<\/p>`:'';
-  return `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>${d.docTipo||'Factura'} ${d.recibo}</title>
+  return `<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>${d.docTipo||'Pedido'} ${d.recibo}</title>
   <script src="vendor/qrcode.min.js"><\/script>
   <style>*{box-sizing:border-box;font-family:'Segoe UI',Arial,sans-serif}body{margin:0;background:#f4f4f0;color:#2c2c2c}
   .r{max-width:360px;margin:20px auto;background:#fff;border-radius:14px;overflow:hidden;box-shadow:0 6px 22px rgba(27,56,43,.15)}
@@ -2050,7 +2104,7 @@ function reciboHTML(d){
   .pay{background:#f4f4f0;border-radius:10px;padding:10px;margin-top:10px;font-size:11px;line-height:1.5}.qr{display:flex;justify-content:center;margin:12px 0}.ft{text-align:center;font-size:10px;color:#6b7c68;padding:0 20px 16px}.noprint{text-align:center;margin:14px}.btn{background:#c8963e;color:#fff;border:none;padding:10px 18px;border-radius:8px;font-weight:700;cursor:pointer;font-size:13px}
   @media print{.noprint{display:none}body{background:#fff}.r{box-shadow:none;margin:0}}<\/style></head><body>
   <div class="r"><div class="hd">${logoTag}<h1>${EMPRESA.nombre}<\/h1><p>${EMPRESA.lema} · ${EMPRESA.lugar}<\/p><p>RUC ${EMPRESA.ruc} · Régimen ${EMPRESA.regimen}<\/p><\/div>
-  <div class="bd"><div class="meta"><span><b>${d.docTipo||'Factura'}:<\/b> ${d.recibo}<\/span><span>${d.fecha}<\/span><\/div><div class="meta"><span><b>Tipo:<\/b> ${d.tipo}<\/span><\/div>
+  <div class="bd"><div class="meta"><span><b>${d.docTipo||'Pedido'} No.:<\/b> ${d.recibo}<\/span><span>${d.fecha}<\/span><\/div>${d.factura?`<div class="meta"><span><b>Factura (Kyte):<\/b> ${d.factura}<\/span><\/div>`:''}<div class="meta"><span><b>Tipo:<\/b> ${d.tipo}<\/span><\/div>
     ${cliBlock}
     <table><thead><tr><td>Descripción<\/td><td style="text-align:center">Cant<\/td><td style="text-align:right">P.U.<\/td><td style="text-align:right">Total<\/td><\/tr><\/thead><tbody>${filas}<\/tbody><tbody style="border-top:1px solid #e2e8e0">${breakdown}<\/tbody><tfoot><tr><td colspan="3">TOTAL<\/td><td style="text-align:right">${money(d.total)}<\/td><\/tr><\/tfoot><\/table>
     ${convNota}
@@ -2074,13 +2128,13 @@ function reciboPedido(r){ const p=PEDIDOS.find(x=>x.recibo===r); if(!p)return;
     else { descGen=+(subItems+ship-(+p.total||0)).toFixed(2); if(descGen<0.5) descGen=0; }
     if(descGen>0 && !descTipos.length){ const pr=calcPromos(subItems, 0); descTipos=pr.tipos.length?pr.tipos:['Descuento aplicado']; }
   }
-  abrirRecibo({recibo:p.recibo,tipo:p.origen,cliente:p.cliente,tel:p.tel||'',fecha:p.fecha,
+  abrirRecibo({docTipo:'Pedido',recibo:p.recibo,factura:numFacturaDe(p.recibo)||'',tipo:p.origen,cliente:p.cliente,tel:p.tel||'',fecha:p.fecha,
     metodo:p.pago==='Crédito'?'Crédito (Fidelidad)':'Transferencia LaFise',
     lineas, subtotal: subItems>0?subItems:p.total, descGen, descTipos, ship, envioNom:ship>0?'Envío a domicilio':'', total:p.total}); }
 function reciboVenta(r){ const v=VENTAS.find(x=>x.recibo===r); if(!v)return;
   const ship=+v.ship||0, desc=+v.desc||0;
   const sub=(v.sub!=null)?+v.sub:Math.max(0,(+v.total||0)-ship+desc);
-  abrirRecibo({recibo:v.recibo,tipo:v.origen,cliente:v.cliente,fecha:fechaHora(),metodo:v.metodo,
+  abrirRecibo({docTipo:'Recibo',recibo:v.recibo,tipo:v.origen,cliente:v.cliente,fecha:fechaHora(),metodo:v.metodo,
     lineas:[{desc:'Venta registrada',cant:1,precio:sub}], subtotal:sub, descGen:desc, descTipos:desc>0?['Descuento aplicado']:[], ship, envioNom:ship>0?'Env\u00edo':'', total:v.total}); }
 
 /* ============================================================
@@ -2397,7 +2451,7 @@ function abonar(id){ const c=CLIENTES.find(x=>x.id===id); if(!c)return; const v=
   registrarAbono({cliente:c.nombre,tel:c.tel||'',monto:v,refFactura:'CxC',fecha:fechaHora(),fechaISO:new Date().toISOString()});
   const abId=ABONOS[0]?ABONOS[0].id:('AB-'+Date.now().toString().slice(-6));
   refrescar(); toast('Abono de '+money(v)+' registrado \u00b7 ingreso a Ingresos');
-  abrirRecibo({docTipo:'Factura',recibo:abId,tipo:'Abono a cuenta por cobrar',cliente:c.nombre,tel:c.tel||'',fecha:fechaHora(),metodo:'Abono',lineas:[{desc:'Abono a cuenta de '+c.nombre,cant:1,precio:v}],subtotal:v,ship:0,total:v,saldoPendiente:saldoFinal}); }
+  abrirRecibo({docTipo:'Recibo de abono',recibo:abId,tipo:'Abono a cuenta por cobrar',cliente:c.nombre,tel:c.tel||'',fecha:fechaHora(),metodo:'Abono',lineas:[{desc:'Abono a cuenta de '+c.nombre,cant:1,precio:v}],subtotal:v,ship:0,total:v,saldoPendiente:saldoFinal}); }
 
 /* Estado de cuenta por cliente y per\u00edodo (por defecto el mes actual). */
 function estadoCuenta(id){ const c=CLIENTES.find(x=>x.id===id); if(!c)return;
