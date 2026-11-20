@@ -1201,13 +1201,13 @@ RENDER.vender = function(){
         <div><label class="text-[11px] font-semibold">Descuento (C$)</label><input id="posDescInp" type="number" min="0" value="${POS_DESC||''}" oninput="POS_DESC=+this.value||0;posRecalc()" class="w-full mt-1 px-3 py-2 rounded-lg border border-gray-200 text-[12px] focus:outline-none focus:border-pg-gold"></div>
         <div><label class="text-[11px] font-semibold">Método de pago</label><select id="posMet" class="w-full mt-1 px-3 py-2 rounded-lg border border-gray-200 text-[12px] focus:outline-none focus:border-pg-gold"><option>Efectivo</option><option>ACH</option><option>Transferencia</option><option>LaFise (QR/Link)</option><option>Crédito (Cta. por cobrar)</option></select></div>
       </div>
-      <label class="flex items-center gap-2 text-[11px] font-semibold text-pg-green mt-2"><input id="posFiel" type="checkbox" ${POS_FIEL?'checked':''} onchange="POS_FIEL=this.checked;posRecalc()"> Aplicar promoción de fidelidad (5%)</label>
+      <label class="flex items-center gap-2 text-[11px] font-semibold text-pg-green mt-2"><input id="posFiel" type="checkbox" ${POS_FIEL?'checked':''} onchange="POS_FIEL=this.checked;posRecalc()"> Aplicar promoción de fidelidad (2%)</label>
       <div class="space-y-1.5 text-sm border-t border-dashed pt-3 mt-3">
         <div class="flex justify-between"><span class="text-pg-muted">Subtotal</span><b id="posSub">${money(t.sub)}</b></div>
         <div id="posDescLine" class="flex justify-between ${t.desc?'':'hidden'}"><span class="text-pg-muted">Descuento</span><b class="text-red-600" id="posDescVal">- ${money(t.desc)}</b></div>
         <div id="posTierLine" class="flex justify-between ${t.promo.tierMonto?'':'hidden'}"><span class="text-pg-muted">Descuento por monto (${t.promo.tierPct}%)</span><b class="text-red-600" id="posTierVal">- ${money(t.promo.tierMonto)}</b></div>
         <div id="posDecLine" class="flex justify-between ${t.promo.decMonto?'':'hidden'}"><span class="text-pg-muted">Premio 10.ª compra (${PROMOS.decima.pct}%)</span><b class="text-red-600" id="posDecVal">- ${money(t.promo.decMonto)}</b></div>
-        <div id="posFielLine" class="flex justify-between ${t.fiel?'':'hidden'}"><span class="text-pg-muted">Promoción fidelidad (5%)</span><b class="text-red-600" id="posFielVal">- ${money(t.fiel)}</b></div>
+        <div id="posFielLine" class="flex justify-between ${t.fiel?'':'hidden'}"><span class="text-pg-muted">Promoción fidelidad (2%)</span><b class="text-red-600" id="posFielVal">- ${money(t.fiel)}</b></div>
         <div class="flex justify-between"><span class="text-pg-muted">Envío</span><b id="posEnvioVal">${money(t.ship)}</b></div>
         <div id="posIrLine" class="flex justify-between ${t.irRet?'':'hidden'}"><span class="text-pg-muted">Retención 2% I.R</span><b class="text-red-600" id="posIrVal">- ${money(t.irRet)}</b></div>
         <div class="flex justify-between text-base border-t border-dashed pt-2 mt-1"><span class="font-bold text-pg-green">TOTAL</span><b class="text-pg-green" id="posTotal">${money(t.total)}</b></div>
@@ -2088,7 +2088,7 @@ function reciboHTML(d){
   if(descGen>0) breakdown+=linea('Descuento'+((d.descTipos&&d.descTipos.length)?' ('+d.descTipos.join(' + ')+')':' aplicado'),descGen,true);
   if(tierMonto>0) breakdown+=linea('Descuento por monto de compra',tierMonto,true);
   if(decMonto>0) breakdown+=linea('Premio 10.ª compra (fidelidad)',decMonto,true);
-  if(fiel>0) breakdown+=linea('Promoción fidelidad (5%)',fiel,true);
+  if(fiel>0) breakdown+=linea('Promoción fidelidad (2%)',fiel,true);
   breakdown+=linea('Costo de envío'+(d.envioNom?' · '+d.envioNom:''),ship);
   if(irRet>0) breakdown+=linea('Retención 2% I.R',irRet,true);
   const logoTag=(typeof LOGO_GOLD!=='undefined'&&LOGO_GOLD)?`<img src="${LOGO_GOLD}" style="width:56px;height:56px;border-radius:50%;object-fit:cover;margin-bottom:6px">`:`<div class="lg">&#127793;<\/div>`;
