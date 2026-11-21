@@ -272,8 +272,10 @@ function kyteDe(p){ var u=(p&&p.kyteUrl)||''; if(u&&u.trim()) return u.trim(); v
 // Convierte un enlace de Google Drive a URL directa de imagen utilizable en <img>
 function driveDirect(url){
   if(!url) return url;
-  let m = url.match(/\/file\/d\/([^/]+)/) || url.match(/[?&]id=([^&]+)/);
-  if(m) return 'https://drive.google.com/uc?export=view&id='+m[1];
+  url=String(url).trim();
+  if(/^data:image\//i.test(url)) return url;
+  const m = url.match(/\/file\/d\/([^/?#&]+)/) || url.match(/[?&]id=([^&#]+)/) || url.match(/lh3\.googleusercontent\.com\/d\/([^/?#&=]+)/);
+  if(m) return 'https://lh3.googleusercontent.com/d/'+m[1]+'=w1600';
   return url;
 }
 
@@ -1304,6 +1306,7 @@ RENDER.catalogo = function(){
     <button onclick="syncPush()" class="text-xs px-3 py-1.5 rounded-lg bg-pg-gold hover:bg-pg-gold2 text-white font-semibold"><i class="fa-solid fa-cloud-arrow-up mr-1"></i> Publicar a Tienda y Tarjeta</button>
     <label title="Lee un archivo CSV exportado de Kyte y actualiza/crea productos en el panel" class="text-xs px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-semibold cursor-pointer"><i class="fa-solid fa-file-import mr-1"></i> Importar desde archivo de Kyte<input type="file" accept=".csv,text/csv,text/plain" class="hidden" onchange="importarKyte(this)"></label>
     <button onclick="resetTodo()" class="text-xs px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-700 text-white font-semibold"><i class="fa-solid fa-trash-can-arrow-up mr-1"></i> Reiniciar desde cero</button>
+    <button onclick="optimizarImagenesPesadas()" title="Reduce el peso de las fotos ya guardadas para que la Tienda cargue más rápido" class="text-xs px-3 py-1.5 rounded-lg bg-pg-leaf hover:bg-pg-green text-white font-semibold"><i class="fa-solid fa-compress mr-1"></i> Aligerar imágenes</button>
     <span id="syncStatus" class="text-[11px] text-pg-muted ml-auto">${SYNC_MSG}</span>
   <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">${cards}</div>`;
 };
@@ -1340,7 +1343,7 @@ function formProducto(p){
               <input id="fImgUrl" value="${esc(FIMG)}" placeholder="Pega el enlace de la imagen (Drive o Kyte)" class="flex-1 px-3 py-2 rounded-lg border border-gray-200 text-[12px] focus:outline-none focus:border-pg-gold">
               <button type="button" onclick="applyImageUrl()" class="px-3 py-2 rounded-lg bg-pg-gold hover:bg-pg-gold2 text-white text-xs font-semibold">Usar</button>
             </div>
-            <p class="text-[10px] text-pg-muted mt-1">Sugerencia: en Google Drive comparte la imagen como “cualquier persona con el enlace” y pégala aquí; se convierte automáticamente a enlace directo.</p>
+            <p class="text-[10px] text-pg-muted mt-1">La imagen se <b>optimiza sola</b> al cargarla (máx. 900 px y ~100 KB), así la Tienda en Línea carga rápido en el celular. También podés pegar un enlace de Google Drive o Kyte.</p>
           </div>
         </div>
         <div><label class="text-xs font-semibold"><i class="fa-solid fa-link text-pg-gold mr-1"></i>Enlace Kyte del producto</label><input id="fKyte" value="${esc(p.kyteUrl||'')}" placeholder="https://proglodelcampo.catalog.kyte.site/..." class="w-full mt-1 px-3 py-2 rounded-lg border border-gray-200 text-[12px] focus:outline-none focus:border-pg-gold"><p class="text-[10px] text-pg-muted mt-1">Al tocar la imagen del producto se abrirá este enlace (en el panel, la tienda y la tarjeta). Si se deja vacío, abre la tienda general.</p></div>
@@ -1383,12 +1386,97 @@ function guardarProducto(id){
   cloudSetOne(PRODUCTOS.find(x=>x.id===pid));
   closeModal(); refrescar();
 }
+/* ---------- Optimizador de imágenes (para que la Tienda cargue rápido) ---------- */
+function fmtKB(b){ b=+b||0; return b>=1048576 ? (b/1048576).toFixed(1)+' MB' : Math.max(1,Math.round(b/1024))+' KB'; }
+
+function pgImgCargar(src){
+  return new Promise(function(res,rej){
+    const i=new Image();
+    i.onload=function(){ res(i); };
+    i.onerror=function(){ rej(new Error('no se pudo leer la imagen')); };
+    i.src=src;
+  });
+}
+
+/* Reduce a maxDim px y comprime (WebP, si no hay, JPEG). Apunta a ~110 KB. */
+function pgImgComprimir(src, maxDim, maxChars){
+  maxDim=maxDim||900; maxChars=maxChars||170000;
+  return pgImgCargar(src).then(function(img){
+    let w=img.naturalWidth||img.width, h=img.naturalHeight||img.height;
+    if(!w||!h) throw new Error('imagen vacía');
+    const esc=Math.min(1, maxDim/Math.max(w,h));
+    w=Math.max(1,Math.round(w*esc)); h=Math.max(1,Math.round(h*esc));
+    const c=document.createElement('canvas'); c.width=w; c.height=h;
+    const ctx=c.getContext('2d');
+    ctx.imageSmoothingEnabled=true; ctx.imageSmoothingQuality='high';
+    ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,w,h);   /* PNG con transparencia -> fondo blanco */
+    ctx.drawImage(img,0,0,w,h);
+
+    let tipo='image/webp', q=0.82, out=c.toDataURL(tipo,q);
+    if(out.indexOf('data:image/webp')!==0){ tipo='image/jpeg'; q=0.85; out=c.toDataURL(tipo,q); }
+    let vueltas=0;
+    while(out.length>maxChars && vueltas<6){ q=Math.max(0.42,q-0.1); out=c.toDataURL(tipo,q); vueltas++; }
+    if(out.length>maxChars){
+      const c2=document.createElement('canvas');
+      c2.width=Math.round(w*0.78); c2.height=Math.round(h*0.78);
+      const x2=c2.getContext('2d');
+      x2.fillStyle='#fff'; x2.fillRect(0,0,c2.width,c2.height);
+      x2.drawImage(c,0,0,c2.width,c2.height);
+      out=c2.toDataURL(tipo,Math.max(0.5,q)); w=c2.width; h=c2.height;
+    }
+    return { data:out, w:w, h:h, bytes:Math.round(((out.split(',')[1]||'').length)*0.75) };
+  });
+}
+
 function pickImageFile(inp){
-  const f=inp.files&&inp.files[0]; if(!f)return;
-  if(f.size>1200000){ toast('Imagen muy grande (máx ~1MB)'); return; }
-  const r=new FileReader();
-  r.onload=e=>{ FIMG=e.target.result; const pv=document.getElementById('fImgPrev'); if(pv) pv.innerHTML='<img src="'+FIMG+'" class="w-full h-full object-cover">'; const uf=document.getElementById('fImgUrl'); if(uf) uf.value=FIMG; toast('Imagen cargada'); };
-  r.readAsDataURL(f);
+  const f=inp.files&&inp.files[0]; if(!f) return;
+  if(f.type && f.type.indexOf('image/')!==0){ toast('Ese archivo no es una imagen'); return; }
+  if(f.size>15*1024*1024){ toast('Imagen demasiado grande (máximo 15 MB)'); return; }
+  toast('Optimizando imagen…');
+  const url=URL.createObjectURL(f);
+  pgImgComprimir(url, 900).then(function(r){
+    FIMG=r.data;
+    const pv=document.getElementById('fImgPrev'); if(pv) pv.innerHTML='<img src="'+FIMG+'" class="w-full h-full object-cover">';
+    const uf=document.getElementById('fImgUrl'); if(uf) uf.value=FIMG;
+    toast('Imagen lista: '+fmtKB(f.size)+' → '+fmtKB(r.bytes)+' ('+r.w+'×'+r.h+')');
+  }).catch(function(){ toast('No se pudo procesar la imagen'); })
+   .then(function(){ URL.revokeObjectURL(url); });
+}
+
+/* ---------- Imagen para ANUNCIOS (banner de la tienda) ---------- */
+function _anPrevisualizar(src){ const pv=document.getElementById('anPrev'); if(pv&&src) pv.innerHTML='<img src="'+src+'" class="w-full h-full object-cover">'; }
+function pickAnuncioFile(inp){
+  const f=inp.files&&inp.files[0]; if(!f) return;
+  if(f.type && f.type.indexOf('image/')!==0){ toast('Ese archivo no es una imagen'); return; }
+  if(f.size>15*1024*1024){ toast('Imagen demasiado grande (máximo 15 MB)'); return; }
+  toast('Optimizando imagen del anuncio…');
+  const url=URL.createObjectURL(f);
+  pgImgComprimir(url, 1400, 340000).then(function(r){
+    const el=document.getElementById('anImg'); if(el) el.value=r.data;
+    _anPrevisualizar(r.data);
+    toast('Anuncio listo: '+fmtKB(f.size)+' → '+fmtKB(r.bytes)+' ('+r.w+'×'+r.h+')');
+  }).catch(function(){ toast('No se pudo procesar la imagen'); })
+   .then(function(){ URL.revokeObjectURL(url); });
+}
+
+/* Aligera las imágenes que ya están guardadas y pesadas */
+function optimizarImagenesPesadas(){
+  const pesadas=PRODUCTOS.filter(function(p){ return /^data:image\//i.test(p.imagen||'') && (p.imagen||'').length>150000; });
+  if(!pesadas.length){ toast('Ninguna imagen pesada: todo listo'); return; }
+  const antes=pesadas.reduce(function(s,p){ return s+p.imagen.length; },0);
+  if(!confirm('Se van a aligerar '+pesadas.length+' imagen(es) del catálogo (aprox. '+fmtKB(antes*0.75)+').\n\n¿Continuar?')) return;
+  let n=0, ahorro=0, i=0;
+  toast('Aligerando imágenes…');
+  (function paso(){
+    if(i>=pesadas.length){
+      toast('Listo: '+n+' imagen(es) aligerada(s), ahorro aprox. '+fmtKB(ahorro*0.75));
+      refrescar(); return;
+    }
+    const p=pesadas[i++];
+    pgImgComprimir(p.imagen,900).then(function(r){
+      if(r.data.length < p.imagen.length*0.9){ ahorro += p.imagen.length - r.data.length; p.imagen=r.data; cloudSetOne(p); n++; }
+    }).catch(function(){}).then(paso);
+  })();
 }
 function applyImageUrl(){
   const uf=document.getElementById('fImgUrl'); if(!uf)return;
@@ -2624,18 +2712,30 @@ function _formAnuncio(id,a){
       <div><label class="text-xs font-semibold">Texto / descripci\u00f3n</label><textarea id="anDesc" rows="2" class="w-full mt-1 px-3 py-2 rounded-lg border border-gray-200 focus:outline-none focus:border-pg-gold" placeholder="Promoci\u00f3n, negocio destacado, d\u00f3nde encontrar nuestros productos…">${esc(a.descripcion||'')}</textarea></div>
       <div><label class="text-xs font-semibold">Enlace (opcional, http/https)</label><input id="anLink" value="${esc(a.enlace||'')}" class="w-full mt-1 px-3 py-2 rounded-lg border border-gray-200 focus:outline-none focus:border-pg-gold" placeholder="https://…"></div>
       <div><label class="text-xs font-semibold">Tipo de contenido</label><select id="anTipo" onchange="_anTipoUI()" class="w-full mt-1 px-3 py-2 rounded-lg border border-gray-200"><option value="imagen"${esV?'':' selected'}>Imagen</option><option value="video"${esV?' selected':''}>Video (embed)</option></select></div>
-      <div id="anBoxImg" class="${esV?'hidden':''}"><label class="text-xs font-semibold">URL de la imagen</label><input id="anImg" value="${esc(a.imagen||'')}" class="w-full mt-1 px-3 py-2 rounded-lg border border-gray-200 focus:outline-none focus:border-pg-gold" placeholder="https://…/imagen.jpg"></div>
+      <div id="anBoxImg" class="${esV?'hidden':''}">
+        <label class="text-xs font-semibold">Imagen del anuncio</label>
+        <div class="flex items-center gap-2 mt-1">
+          <div id="anPrev" class="w-16 h-16 rounded-lg bg-white border border-gray-200 overflow-hidden flex items-center justify-center text-pg-muted shrink-0"><i class="fa-regular fa-image"></i></div>
+          <label class="flex-1 flex items-center justify-center gap-2 text-[11px] font-semibold text-pg-green cursor-pointer bg-white border border-gray-200 rounded-lg px-2 py-2 hover:border-pg-gold">
+            <i class="fa-solid fa-upload"></i> Cargar desde la galería
+            <input type="file" accept="image/*" class="hidden" onchange="pickAnuncioFile(this)">
+          </label>
+        </div>
+        <input id="anImg" value="${esc(a.imagen||'')}" class="w-full mt-2 px-3 py-2 rounded-lg border border-gray-200 focus:outline-none focus:border-pg-gold text-[11px]" placeholder="https://…/imagen.jpg (o cargala desde la galería)">
+        <p class="text-[10px] text-pg-muted mt-1">La foto se <b>optimiza sola</b> (máx. 1400 px y ~250 KB). Si pegás un enlace de Google Drive, se convierte a enlace directo automáticamente.</p>
+      </div>
       <div id="anBoxVid" class="${esV?'':'hidden'}"><label class="text-xs font-semibold">URL de video (embed)</label><input id="anUrl" value="${esc(a.url||'')}" class="w-full mt-1 px-3 py-2 rounded-lg border border-gray-200 focus:outline-none focus:border-pg-gold" placeholder="https://www.youtube.com/embed/ID"><p class="text-[10px] text-pg-muted mt-1">Use el enlace “incrustar/embed” (YouTube: /embed/ID).</p></div>
       <div class="grid grid-cols-2 gap-3"><div><label class="text-xs font-semibold">Color de fondo</label><input id="anFondo" type="color" value="${/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(a.fondo||'')?a.fondo:'#1b382b'}" class="w-full mt-1 h-10 rounded-lg border border-gray-200"></div><div class="flex items-end"><label class="inline-flex items-center gap-2 text-sm"><input id="anAct" type="checkbox" ${a.activo!==false?'checked':''}> Activo (visible en la tienda)</label></div></div>
     </div>
     <div class="flex gap-2 mt-5"><button onclick="closeModal()" class="flex-1 py-2.5 rounded-lg bg-gray-100 text-sm font-semibold">Cancelar</button><button onclick="guardarAnuncio('${id}')" class="flex-1 py-2.5 rounded-lg bg-pg-gold hover:bg-pg-gold2 text-white text-sm font-semibold">Guardar</button></div></div>`);
+  if(!esV && a.imagen) _anPrevisualizar(a.imagen);
 }
 function _anTipoUI(){ const v=(document.getElementById('anTipo')||{}).value; const bi=document.getElementById('anBoxImg'), bv=document.getElementById('anBoxVid'); if(bi)bi.classList.toggle('hidden',v==='video'); if(bv)bv.classList.toggle('hidden',v!=='video'); }
 function guardarAnuncio(id){
   const tit=(document.getElementById('anTit').value||'').trim();
   const tipo=(document.getElementById('anTipo').value||'imagen');
   const link=(document.getElementById('anLink').value||'').trim();
-  const img=(document.getElementById('anImg').value||'').trim();
+  const img=driveDirect((document.getElementById('anImg').value||'').trim());
   const url=(document.getElementById('anUrl').value||'').trim();
   if(!tit){ toast('Indique un t\u00edtulo'); return; }
   if(link&&!/^https?:\/\//i.test(link)){ toast('El enlace debe iniciar con http:// o https://'); return; }
